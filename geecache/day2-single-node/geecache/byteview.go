@@ -1,7 +1,11 @@
 package geecache
 
+/**
+我们抽象了一个只读数据结构 ByteView 用来表示缓存值，是 GeeCache 主要的数据结构之一。
+b 是只读的，使用 ByteSlice() 方法返回一个拷贝，防止缓存值被外部程序修改。
+*/
 type ByteView struct {
-	b []byte // b 是只读的，使用 ByteSlice() 方法返回一个拷贝，防止缓存值被外部程序修改。
+	b []byte
 }
 
 func (v ByteView) Len() int {

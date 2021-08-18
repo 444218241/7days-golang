@@ -53,6 +53,7 @@ func assertDemo() {
 	fmt.Println(value, ok)
 	// { 0 0} true
 	// 断言成功：value表示断言成功之后目标类型变量；
+	// 或者：value := b.(Parrot)
 }
 
 func staticAndDynamicTypeDemo() {
