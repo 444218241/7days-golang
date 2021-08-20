@@ -2,19 +2,26 @@ package geecache
 
 import (
 	"fmt"
+	"geecache/consistenthash"
+	"io/ioutil"
 	"log"
 	"net/http"
+	"net/url"
 	"strings"
+	"sync"
 )
 
-const defaultBasePath = "/_geecache/"
+const (
+	defaultBasePath = "/_geecache/"
+	defaultReplicas = 50
+)
 
 type HTTPPool struct {
-	self     string // 用来记录自己的地址，包括主机名/IP 和端口。
-	basePath string // 作为节点间通讯地址的前缀，默认是 /_geecache/，
-	// 那么 http://example.com/_geecache/ 开头的请求，就用于节点间的访问。
-	// 因为一个主机上还可能承载其他的服务，加一段 Path 是一个好习惯。
-	// 比如，大部分网站的 API 接口，一般以 /api 作为前缀。
+	self        string
+	basePath    string
+	mu          sync.Mutex
+	peers       *consistenthash.Map
+	httpGetters map[string]*httpGetter
 }
 
 func NewHTTPPool(self string) *HTTPPool {
@@ -25,20 +32,17 @@ func NewHTTPPool(self string) *HTTPPool {
 }
 
 // Log info with server name
-func (p HTTPPool) Log(format string, v ...interface{}) {
+func (p *HTTPPool) Log(format string, v ...interface{}) {
 	log.Printf("[Server %s] %s", p.self, fmt.Sprintf(format, v...))
 }
 
-// ServeHTTP handle all http request
+// ServeHTTP handle all http requests
 func (p *HTTPPool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	// 我们约定访问路径格式为 /<basepath>/<groupname>/<key>，
-	// 通过 groupname 得到 group 实例，
-	// 再使用 group.Get(key) 获取缓存数据。
 	if !strings.HasPrefix(r.URL.Path, p.basePath) {
-		panic("HTTPPool serving unexcepted path: " + r.URL.Path)
+		panic("HTTPPool serving unexpected path: " + r.URL.Path)
 	}
 	p.Log("%s %s", r.Method, r.URL.Path)
-
+	// /<basepath>/<groupname>/<key> required
 	parts := strings.SplitN(r.URL.Path[len(p.basePath):], "/", 2)
 	if len(parts) != 2 {
 		http.Error(w, "bad request", http.StatusBadRequest)
@@ -46,13 +50,14 @@ func (p *HTTPPool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	groupName := parts[0]
+	key := parts[1]
+
 	group := GetGroup(groupName)
 	if group == nil {
-		http.Error(w, "no such group"+groupName, http.StatusNotFound)
+		http.Error(w, "no such group: "+groupName, http.StatusNotFound)
 		return
 	}
 
-	key := parts[1]
 	view, err := group.Get(key)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -62,3 +67,63 @@ func (p *HTTPPool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Write(view.ByteSlice())
 }
+
+type httpGetter struct {
+	baseURL string
+}
+
+// Get ： httpGetter struct 实现了 PeerGetter interface 的 Get 方法
+func (h *httpGetter) Get(group string, key string) ([]byte, error) {
+	u := fmt.Sprintf(
+		"%v%v/%v",
+		h.baseURL,
+		url.QueryEscape(group),
+		url.QueryEscape(key),
+	)
+
+	res, err := http.Get(u)
+	if err != nil {
+		return nil, err
+	}
+	defer res.Body.Close()
+
+	if res.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("server returned :%v", res.Status)
+	}
+	bytes, err := ioutil.ReadAll(res.Body)
+	if err != nil {
+		return nil, fmt.Errorf("reading response body: %v", err)
+	}
+	return bytes, nil
+}
+
+var _ PeerGetter = (*httpGetter)(nil)
+
+// ---- 第二步，为 HTTPPool 添加节点选择的功能。 ------------------------
+
+// ---- 第三步，实现 PeerPicker 接口。 ------------------------------
+
+func (h *HTTPPool) Set(peers ...string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	h.peers = consistenthash.New(defaultReplicas, nil)
+	h.peers.Add(peers...)
+	h.httpGetters = make(map[string]*httpGetter, len(peers))
+	for _, peer := range peers {
+		h.httpGetters[peer] = &httpGetter{baseURL: peer + h.basePath}
+	}
+}
+
+// PickPeer picks a peer according to key
+func (p *HTTPPool) PickPeer(key string) (PeerGetter, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if peer := p.peers.Get(key); peer != "" && peer != p.self {
+		p.Log("Pick peer %s", peer)
+		return p.httpGetters[peer], true
+	}
+	return nil, false
+}
+
+var _ PeerPicker = (*HTTPPool)(nil)
